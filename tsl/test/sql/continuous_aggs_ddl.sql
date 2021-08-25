@@ -6,7 +6,36 @@
 -- results are compared
 \set QUERY_RESULT_TEST_EQUAL_RELPATH '../../../test/sql/include/query_result_test_equal.sql'
 
-\set ON_ERROR_STOP 0
+------------------------------------
+-- Set up a distributed environment
+------------------------------------
+\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
+
+\set DATA_NODE_1 :TEST_DBNAME _1
+\set DATA_NODE_2 :TEST_DBNAME _2
+\set DATA_NODE_3 :TEST_DBNAME _3
+
+\ir include/remote_exec.sql
+
+SELECT (add_data_node (name, host => 'localhost', DATABASE => name)).*
+FROM (VALUES (:'DATA_NODE_1'), (:'DATA_NODE_2'), (:'DATA_NODE_3')) v (name);
+
+GRANT USAGE ON FOREIGN SERVER :DATA_NODE_1, :DATA_NODE_2, :DATA_NODE_3 TO PUBLIC;
+
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+CREATE TABLE IS_DISTRIBUTED("STATUS" BOOLEAN);
+INSERT INTO IS_DISTRIBUTED VALUES(FALSE);
+
+DO $do$
+BEGIN
+  IF (SELECT "STATUS" FROM IS_DISTRIBUTED) THEN
+    RAISE NOTICE 'Running distributed hypertable tests';
+  ELSE
+    RAISE NOTICE 'Running local hypertable tests';
+  END IF;
+END
+$do$;
 
 --DDL commands on continuous aggregates
 
@@ -19,11 +48,19 @@ CREATE TABLE conditions (
       timeinterval INTERVAL
 );
 
-select table_name from create_hypertable('conditions', 'timec');
+DO $do$
+BEGIN
+  IF (SELECT "STATUS" FROM IS_DISTRIBUTED) THEN
+    PERFORM(SELECT create_distributed_hypertable('conditions', 'timec', replication_factor => 2));
+  ELSE
+    PERFORM(SELECT create_hypertable('conditions', 'timec'));
+  END IF;
+END
+$do$;
 
 -- schema tests
 
-\c :TEST_DBNAME :ROLE_SUPERUSER
+\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
 CREATE TABLESPACE tablespace1 OWNER :ROLE_DEFAULT_PERM_USER LOCATION :TEST_TABLESPACE1_PATH;
 CREATE TABLESPACE tablespace2 OWNER :ROLE_DEFAULT_PERM_USER LOCATION :TEST_TABLESPACE2_PATH;
 
@@ -33,7 +70,15 @@ GRANT ALL ON SCHEMA rename_schema TO :ROLE_DEFAULT_PERM_USER;
 SET ROLE :ROLE_DEFAULT_PERM_USER;
 
 CREATE TABLE foo(time TIMESTAMPTZ, data INTEGER);
-SELECT create_hypertable('foo', 'time');
+DO $do$
+BEGIN
+  IF (SELECT "STATUS" FROM IS_DISTRIBUTED) THEN
+    PERFORM(SELECT create_distributed_hypertable('foo', 'time', replication_factor => 2));
+  ELSE
+    PERFORM(SELECT create_hypertable('foo', 'time'));
+  END IF;
+END
+$do$;
 
 CREATE MATERIALIZED VIEW rename_test
   WITH ( timescaledb.continuous, timescaledb.materialized_only=true)
@@ -147,8 +192,12 @@ DROP TABLE conditions CASCADE;
 DROP TABLE foo CASCADE;
 
 CREATE TABLE drop_chunks_table(time BIGINT, data INTEGER);
-SELECT hypertable_id AS drop_chunks_table_id
-    FROM create_hypertable('drop_chunks_table', 'time', chunk_time_interval => 10) \gset
+CREATE TEMPORARY TABLE drop_chunks_table_id AS
+  SELECT hypertable_id
+      FROM create_hypertable('drop_chunks_table', 'time', chunk_time_interval => 10);
+
+--SELECT hypertable_id AS drop_chunks_table_id
+  --  FROM create_hypertable('drop_chunks_table', 'time', chunk_time_interval => 10) \gset
 
 CREATE OR REPLACE FUNCTION integer_now_test() returns bigint LANGUAGE SQL STABLE as $$ SELECT coalesce(max(time), bigint '0') FROM drop_chunks_table $$;
 SELECT set_integer_now_func('drop_chunks_table', 'integer_now_test');
@@ -166,7 +215,7 @@ SELECT format('%I.%I', schema_name, table_name) AS drop_chunks_mat_table,
         schema_name AS drop_chunks_mat_schema,
         table_name AS drop_chunks_mat_table_name
     FROM _timescaledb_catalog.hypertable, _timescaledb_catalog.continuous_agg
-    WHERE _timescaledb_catalog.continuous_agg.raw_hypertable_id = :drop_chunks_table_id
+    WHERE _timescaledb_catalog.continuous_agg.raw_hypertable_id = drop_chunks_table_id.hypertable_id
         AND _timescaledb_catalog.hypertable.id = _timescaledb_catalog.continuous_agg.mat_hypertable_id \gset
 
 -- create 3 chunks, with 3 time bucket
@@ -735,7 +784,7 @@ ALTER MATERIALIZED VIEW owner_check OWNER TO :ROLE_1;
 \set ON_ERROR_STOP 1
 
 -- Superuser can always change owner 
-SET ROLE :ROLE_SUPERUSER;
+SET ROLE :ROLE_CLUSTER_SUPERUSER;
 ALTER MATERIALIZED VIEW owner_check OWNER TO :ROLE_1;
 
 \x on
@@ -916,4 +965,4 @@ GROUP BY location, bucket;
 ALTER MATERIALIZED VIEW conditions_daily RENAME COLUMN bucket to "time";
 
 -- This will rebuild the materialized view and should succeed.
-ALTER MATERIALIZED VIEW conditions_daily SET (timescaledb.materialized_only = false); 
+ALTER MATERIALIZED VIEW conditions_daily SET (timescaledb.materialized_only = false);

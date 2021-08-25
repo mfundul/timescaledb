@@ -2,18 +2,41 @@
 -- Please see the included NOTICE for copyright information and
 -- LICENSE-TIMESCALE for a copy of the license.
 
+------------------------------------
+-- Set up a distributed environment
+------------------------------------
+\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
+
+\set DATA_NODE_1 :TEST_DBNAME _1
+\set DATA_NODE_2 :TEST_DBNAME _2
+\set DATA_NODE_3 :TEST_DBNAME _3
+
+\ir include/remote_exec.sql
+
+SELECT (add_data_node (name, host => 'localhost', DATABASE => name)).*
+FROM (VALUES (:'DATA_NODE_1'), (:'DATA_NODE_2'), (:'DATA_NODE_3')) v (name);
+
+GRANT USAGE ON FOREIGN SERVER :DATA_NODE_1, :DATA_NODE_2, :DATA_NODE_3 TO PUBLIC;
+SELECT pg_backend_pid();
+SELECT pg_sleep(0.60);
+
 -- Disable background workers since we are testing manual refresh
-\c :TEST_DBNAME :ROLE_SUPERUSER
+--\c :TEST_DBNAME :ROLE_SUPERUSER
 SELECT _timescaledb_internal.stop_background_workers();
+CALL distributed_exec('SELECT _timescaledb_internal.stop_background_workers()');
+SET timescaledb.enable_per_data_node_queries TO false;
+
 SET ROLE :ROLE_DEFAULT_PERM_USER;
 SET datestyle TO 'ISO, YMD';
 SET timezone TO 'UTC';
 
 CREATE TABLE conditions (time bigint NOT NULL, device int, temp float);
-SELECT create_hypertable('conditions', 'time', chunk_time_interval => 10);
+--SELECT create_hypertable('conditions', 'time', chunk_time_interval => 10);
+SELECT create_distributed_hypertable('conditions', 'time', chunk_time_interval => 10, replication_factor => 2);
 
 CREATE TABLE measurements (time int NOT NULL, device int, temp float);
-SELECT create_hypertable('measurements', 'time', chunk_time_interval => 10);
+--SELECT create_hypertable('measurements', 'time', chunk_time_interval => 10);
+SELECT create_distributed_hypertable('measurements', 'time', chunk_time_interval => 10, replication_factor => 2);
 
 CREATE OR REPLACE FUNCTION bigint_now()
 RETURNS bigint LANGUAGE SQL STABLE AS
@@ -22,12 +45,30 @@ $$
     FROM conditions
 $$;
 
+CALL distributed_exec($exec$
+CREATE OR REPLACE FUNCTION bigint_now()
+RETURNS bigint LANGUAGE SQL STABLE AS
+$$
+    SELECT coalesce(max(time), 0)
+    FROM conditions
+$$
+$exec$);
+
 CREATE OR REPLACE FUNCTION int_now()
 RETURNS int LANGUAGE SQL STABLE AS
 $$
     SELECT coalesce(max(time), 0)
     FROM measurements
 $$;
+
+CALL distributed_exec($exec$
+CREATE OR REPLACE FUNCTION int_now()
+RETURNS int LANGUAGE SQL STABLE AS
+$$
+    SELECT coalesce(max(time), 0)
+    FROM measurements
+$$;
+$exec$);
 
 SELECT set_integer_now_func('conditions', 'bigint_now');
 SELECT set_integer_now_func('measurements', 'int_now');
@@ -37,8 +78,17 @@ SELECT t, ceil(abs(timestamp_hash(to_timestamp(t)::timestamp))%4)::int,
        abs(timestamp_hash(to_timestamp(t)::timestamp))%40
 FROM generate_series(1, 100, 1) t;
 
-INSERT INTO measurements
 SELECT * FROM conditions;
+
+CREATE TABLE conditions_temp(time bigint NOT NULL, device int, temp float);
+SELECT create_hypertable('conditions_temp', 'time', chunk_time_interval => 10);
+INSERT INTO conditions_temp
+SELECT * FROM conditions;
+
+INSERT INTO measurements
+--SELECT * FROM conditions;
+SELECT * FROM conditions_temp;
+DROP TABLE conditions_temp;
 
 -- Show the most recent data
 SELECT * FROM conditions
@@ -160,6 +210,10 @@ INSERT INTO conditions VALUES (60, 3, 23.7), (70, 4, 23.7);
 
 -- Should see some invaliations in the hypertable invalidation log:
 SELECT * FROM hyper_invals;
+
+-- HELLO THERE MARKOS!
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+CALL distributed_exec('SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log');
 
 -- Generate some invalidations for the other hypertable
 INSERT INTO measurements VALUES (20, 4, 23.7);
@@ -434,6 +488,28 @@ CALL refresh_continuous_aggregate('cond_1', 2, 3);
 SELECT * FROM cond_1
 ORDER BY 1,2;
 
+
+
+
+
+
+
+
+-- Show the data before dropping one of the chunks
+SELECT show_chunks AS chunk_to_drop
+FROM show_chunks('conditions');
+SELECT * FROM conditions
+ORDER BY 1,2;
+
+
+
+
+
+
+
+
+
+
 -- Clear and repeat but instead refresh the whole range in one go. The
 -- result should be the same as the three partial refreshes. Use
 -- DELETE instead of TRUNCATE to clear this time.
@@ -449,7 +525,8 @@ ORDER BY 1,2;
 -- Test that invalidation threshold is capped
 ----------------------------------------------
 CREATE table threshold_test (time int, value int);
-SELECT create_hypertable('threshold_test', 'time', chunk_time_interval => 4);
+--SELECT create_hypertable('threshold_test', 'time', chunk_time_interval => 4);
+SELECT create_distributed_hypertable('threshold_test', 'time', chunk_time_interval => 4, replication_factor => 2);
 SELECT set_integer_now_func('threshold_test', 'int_now');
 
 CREATE MATERIALIZED VIEW thresh_2
@@ -592,7 +669,11 @@ SELECT * FROM conditions
 ORDER BY 1,2;
 
 -- Drop one chunk
-DROP TABLE :chunk_to_drop;
+--DROP TABLE :chunk_to_drop;
+/*CALL distributed_exec('DROP TABLE IF EXISTS '
+:'chunk_to_drop');
+DROP FOREIGN TABLE :chunk_to_drop;*/
+SELECT drop_chunks('conditions', 11);
 
 -- The chunk's data no longer exists in the hypertable
 SELECT * FROM conditions
